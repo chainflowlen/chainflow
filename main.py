@@ -41,6 +41,14 @@ def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Dated sub-directories so each run is archived independently
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    run_data_dir = DATA_DIR / today
+    run_output_dir = OUTPUT_DIR / today
+    run_data_dir.mkdir(parents=True, exist_ok=True)
+    run_output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Run date: {today}  →  data/{today}/  |  output/{today}/")
+
     if not config.ALCHEMY_API_KEY:
         print(
             "ERROR: ALCHEMY_API_KEY is not set.\n"
@@ -63,7 +71,7 @@ def main() -> None:
     _banner(1, 6, "Fetching 24h USDC/USDT transfers from Alchemy…")
     transfers_24h = fetch_transfers(config.ALCHEMY_API_KEY, hours=24)
 
-    transfers_path = DATA_DIR / "transfers.csv"
+    transfers_path = run_data_dir / "transfers.csv"
     transfers_24h.to_csv(transfers_path, index=False)
     print(f"  Saved {len(transfers_24h):,} rows → {transfers_path}")
 
@@ -78,7 +86,7 @@ def main() -> None:
     else:
         print(netflow_df.to_string(index=False))
 
-    netflow_path = OUTPUT_DIR / "netflow_24h.csv"
+    netflow_path = run_output_dir / "netflow_24h.csv"
     netflow_df.to_csv(netflow_path, index=False)
     print(f"  Saved → {netflow_path}")
 
@@ -100,7 +108,7 @@ def main() -> None:
         f"${config.WHALE_THRESHOLD:,.0f}"
     )
 
-    whale_path = OUTPUT_DIR / "whale_alerts.csv"
+    whale_path = run_output_dir / "whale_alerts.csv"
     whales.to_csv(whale_path, index=False)
     print(f"  Saved whale alerts → {whale_path}")
 
@@ -113,7 +121,7 @@ def main() -> None:
     daily_df = daily_netflow(cex_flows_7d, labels)
     chart_path = plot_netflow_chart(
         daily_df,
-        output_path=str(OUTPUT_DIR / "netflow_7d.png"),
+        output_path=str(run_output_dir / "netflow_7d.png"),
     )
     print(f"  Chart saved → {chart_path}")
 
@@ -129,7 +137,7 @@ def main() -> None:
         "netflow_chart": netflow_chart_post(chart_path, signal, ts[:10]),
     }
 
-    posts_dir = OUTPUT_DIR / "posts"
+    posts_dir = run_output_dir / "posts"
     posts_dir.mkdir(exist_ok=True)
 
     for name, content in posts.items():
@@ -138,14 +146,15 @@ def main() -> None:
         print(f"\n  ── {post_file} ──")
         print(content)
 
-    _banner(6, 6, "Done. All outputs saved to output/")
+    _banner(6, 6, f"Done. All outputs saved to output/{today}/")
     print(
-        f"\n  output/netflow_24h.csv\n"
-        f"  output/whale_alerts.csv\n"
-        f"  output/netflow_7d.png\n"
-        f"  output/posts/stablecoin_flow.txt\n"
-        f"  output/posts/whale_alert.txt\n"
-        f"  output/posts/netflow_chart.txt\n"
+        f"\n  data/{today}/transfers.csv\n"
+        f"  output/{today}/netflow_24h.csv\n"
+        f"  output/{today}/whale_alerts.csv\n"
+        f"  output/{today}/netflow_7d.png\n"
+        f"  output/{today}/posts/stablecoin_flow.txt\n"
+        f"  output/{today}/posts/whale_alert.txt\n"
+        f"  output/{today}/posts/netflow_chart.txt\n"
     )
 
 

@@ -10,6 +10,8 @@ Provides two entry points:
         Makes one request per (token, address, direction), then deduplicates.
 """
 
+import time
+
 import requests
 import pandas as pd
 
@@ -32,6 +34,9 @@ def _get_current_block(url: str) -> int:
     return int(resp.json()["result"], 16)
 
 
+_RATE_LIMIT_DELAY = 0.05   # 20 req/s, well under the 25 req/s free-tier cap
+
+
 def _paginate_transfers(url: str, params: dict) -> list[dict]:
     """Call alchemy_getAssetTransfers with automatic pagination."""
     records: list[dict] = []
@@ -52,6 +57,7 @@ def _paginate_transfers(url: str, params: dict) -> list[dict]:
             timeout=30,
         )
         resp.raise_for_status()
+        time.sleep(_RATE_LIMIT_DELAY)  # respect 25 req/s rate limit
 
         result = resp.json().get("result", {})
         records.extend(result.get("transfers", []))
