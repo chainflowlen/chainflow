@@ -1,9 +1,13 @@
 """
 src/fetch.py — Alchemy API data acquisition.
 
-Provides two entry points:
+Provides three entry points:
+  fetch_transfers_for_date(api_key, target_date)
+      → All USDC/USDT transfers for a specific calendar day (UTC), using
+        binary-search block lookup for precise boundaries.
+
   fetch_transfers(api_key, hours=24)
-      → All USDC/USDT transfers over the past N hours (for 24h signals).
+      → All USDC/USDT transfers over the past N hours (rolling window).
 
   fetch_cex_flows(api_key, cex_addresses, days=7)
       → USDC/USDT transfers to/from specific CEX addresses (for 7-day chart).
@@ -11,6 +15,7 @@ Provides two entry points:
 """
 
 import time
+from datetime import date, datetime, timezone
 
 import requests
 import pandas as pd
@@ -35,6 +40,31 @@ def _get_current_block(url: str) -> int:
 
 
 _RATE_LIMIT_DELAY = 0.05   # 20 req/s, well under the 25 req/s free-tier cap
+
+
+def _get_block_at_timestamp(url: str, target_ts: int) -> int:
+    """Binary-search for the first block whose timestamp >= target_ts (Unix seconds)."""
+    lo = 1
+    hi = _get_current_block(url)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        resp = requests.post(
+            url,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "eth_getBlockByNumber",
+                "params": [hex(mid), False],  # False = header only, no full tx list
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        block_ts = int(resp.json()["result"]["timestamp"], 16)
+        if block_ts < target_ts:
+            lo = mid + 1
+        else:
+            hi = mid
+    return lo
 
 
 def _paginate_transfers(url: str, params: dict) -> list[dict]:
@@ -89,6 +119,53 @@ def _to_df(raw: list[dict], token: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
+def fetch_transfers_for_date(api_key: str, target_date: date) -> pd.DataFrame:
+    """
+    Fetch all USDC and USDT ERC-20 transfers for an exact calendar day (UTC).
+
+    Uses binary-search block lookup (~24 RPC calls each) to pinpoint the
+    fromBlock / toBlock boundaries, so results are not affected by block-time
+    variance and always cover exactly 00:00:00 – 23:59:59 UTC of target_date.
+    """
+    url = f"https://eth-mainnet.g.alchemy.com/v2/{api_key}"
+
+    start_ts = int(datetime(target_date.year, target_date.month, target_date.day,
+                            tzinfo=timezone.utc).timestamp())
+    end_ts = start_ts + 86400  # exclusive upper bound = next day 00:00:00 UTC
+
+    print(f"  Binary-searching start block (target: {target_date} 00:00 UTC)…")
+    from_block = _get_block_at_timestamp(url, start_ts)
+
+    print(f"  Binary-searching end block   (target: {target_date} 24:00 UTC)…")
+    to_block = _get_block_at_timestamp(url, end_ts) - 1  # last block of the day
+
+    print(f"  Block range: {from_block:,} → {to_block:,}  ({to_block - from_block + 1:,} blocks)")
+
+    frames: list[pd.DataFrame] = []
+
+    for token, contract in [("USDC", USDC_CONTRACT), ("USDT", USDT_CONTRACT)]:
+        params = {
+            "fromBlock": hex(from_block),
+            "toBlock":   hex(to_block),
+            "contractAddresses": [contract],
+            "category": ["erc20"],
+            "withMetadata": True,
+            "excludeZeroValue": True,
+            "maxCount": "0x3e8",  # 1 000 per page
+        }
+        raw = _paginate_transfers(url, params)
+        frames.append(_to_df(raw, token))
+        print(f"  {token}: fetched {len(raw):,} transfers")
+
+    if not frames:
+        return pd.DataFrame(
+            columns=["hash", "time", "from_address", "to_address", "amount", "token"]
+        )
+
+    df = pd.concat(frames, ignore_index=True)
+    return df.drop_duplicates(subset=["hash", "token", "from_address", "to_address"])
+
 
 def fetch_transfers(api_key: str, hours: int = 24) -> pd.DataFrame:
     """

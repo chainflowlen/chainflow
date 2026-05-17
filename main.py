@@ -2,12 +2,12 @@
 """
 ChainFlow Lens — main pipeline.
 
-Executes the full 2-day work plan in sequence:
-  Step 1  Fetch 24h USDC/USDT transfers via Alchemy
-  Step 2  Save raw transfers to data/transfers.csv
+Executes the full pipeline in sequence:
+  Step 1  Fetch yesterday's USDC/USDT transfers via Alchemy (exact 00:00–24:00 UTC)
+  Step 2  Save raw transfers to data/YYYY-MM-DD/transfers.csv
   Step 3  Calculate CEX netflow (per exchange, per token)
   Step 4  Compute flow signal + whale alerts
-  Step 5  Fetch 7-day CEX flows and render netflow chart
+  Step 5  Build 7-day chart from the last 7 saved daily CSVs (no extra API calls)
   Step 6  Write three post templates to output/posts/
 
 Usage:
@@ -20,10 +20,10 @@ Prerequisites:
 import sys
 import pandas as pd
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import config
-from src.fetch import fetch_transfers, fetch_cex_flows
+from src.fetch import fetch_transfers_for_date
 from src.metrics import calculate_netflow, daily_netflow
 from src.signals import flow_signal, whale_signal
 from src.chart import plot_netflow_chart
@@ -41,13 +41,14 @@ def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Dated sub-directories so each run is archived independently
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Directories are named after the data date (yesterday in UTC)
+    yesterday_date = date.today() - timedelta(days=1)
+    today = yesterday_date.strftime("%Y-%m-%d")  # used as folder name throughout
     run_data_dir = DATA_DIR / today
     run_output_dir = OUTPUT_DIR / today
     run_data_dir.mkdir(parents=True, exist_ok=True)
     run_output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Run date: {today}  →  data/{today}/  |  output/{today}/")
+    print(f"Data date: {today} (yesterday UTC)  →  data/{today}/  |  output/{today}/")
 
     if not config.ALCHEMY_API_KEY:
         print(
@@ -66,10 +67,10 @@ def main() -> None:
     cex_addresses: list[str] = labels["address"].tolist()
 
     # ------------------------------------------------------------------
-    # STEP 1 & 2 — Fetch 24h transfers and save to CSV
+    # STEP 1 & 2 — Fetch yesterday's transfers and save to CSV
     # ------------------------------------------------------------------
-    _banner(1, 6, "Fetching 24h USDC/USDT transfers from Alchemy…")
-    transfers_24h = fetch_transfers(config.ALCHEMY_API_KEY, hours=24)
+    _banner(1, 6, f"Fetching USDC/USDT transfers for {today} (00:00–24:00 UTC)…")
+    transfers_24h = fetch_transfers_for_date(config.ALCHEMY_API_KEY, yesterday_date)
 
     transfers_path = run_data_dir / "transfers.csv"
     transfers_24h.to_csv(transfers_path, index=False)
@@ -113,10 +114,28 @@ def main() -> None:
     print(f"  Saved whale alerts → {whale_path}")
 
     # ------------------------------------------------------------------
-    # STEP 5 — 7-day chart
+    # STEP 5 — 7-day chart (assembled from saved daily CSVs, no API call)
     # ------------------------------------------------------------------
-    _banner(4, 6, "Fetching 7-day CEX flows for chart…")
-    cex_flows_7d = fetch_cex_flows(config.ALCHEMY_API_KEY, cex_addresses, days=7)
+    _banner(4, 6, "Building 7-day netflow chart from saved daily CSVs…")
+    csv_frames: list[pd.DataFrame] = []
+    for i in range(7):
+        d = yesterday_date - timedelta(days=i)
+        p = DATA_DIR / d.strftime("%Y-%m-%d") / "transfers.csv"
+        if p.exists():
+            csv_frames.append(pd.read_csv(p))
+            print(f"  Loaded {p}")
+        else:
+            print(f"  (missing: {p})")
+
+    if csv_frames:
+        cex_flows_7d = pd.concat(csv_frames, ignore_index=True).drop_duplicates(
+            subset=["hash", "token", "from_address", "to_address"]
+        )
+    else:
+        cex_flows_7d = pd.DataFrame(
+            columns=["hash", "time", "from_address", "to_address", "amount", "token"]
+        )
+    print(f"  7-day dataset: {len(cex_flows_7d):,} transfers across {len(csv_frames)} day(s)")
 
     daily_df = daily_netflow(cex_flows_7d, labels)
     chart_path = plot_netflow_chart(
