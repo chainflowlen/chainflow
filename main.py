@@ -41,8 +41,15 @@ def main() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Directories are named after the data date (yesterday in UTC)
-    yesterday_date = date.today() - timedelta(days=1)
+    # Directories are named after the data date (yesterday in UTC, or CLI override)
+    if len(sys.argv) >= 2:
+        try:
+            yesterday_date = date.fromisoformat(sys.argv[1])
+        except ValueError:
+            print(f"ERROR: Invalid date '{sys.argv[1]}'. Use YYYY-MM-DD format.")
+            sys.exit(1)
+    else:
+        yesterday_date = date.today() - timedelta(days=1)
     today = yesterday_date.strftime("%Y-%m-%d")  # used as folder name throughout
     run_data_dir = DATA_DIR / today
     run_output_dir = OUTPUT_DIR / today
