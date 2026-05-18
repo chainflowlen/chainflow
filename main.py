@@ -77,10 +77,10 @@ def main() -> None:
     # STEP 1 & 2 — Fetch yesterday's transfers and save to CSV
     # ------------------------------------------------------------------
     _banner(1, 6, f"Fetching USDC/USDT transfers for {today} (00:00–24:00 UTC)…")
-    transfers_24h = fetch_transfers_for_date(config.ALCHEMY_API_KEY, yesterday_date)
-
     transfers_path = run_data_dir / "transfers.csv"
-    transfers_24h.to_csv(transfers_path, index=False)
+    transfers_24h = fetch_transfers_for_date(
+        config.ALCHEMY_API_KEY, yesterday_date, csv_path=transfers_path
+    )
     print(f"  Saved {len(transfers_24h):,} rows → {transfers_path}")
 
     # ------------------------------------------------------------------
