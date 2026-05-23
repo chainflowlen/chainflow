@@ -1,142 +1,293 @@
-#!/usr/bin/env python3
 """
-find_potential_whales.py — Identify potential whale addresses from daily transfer data.
+find_potential_whales.py — Identify potential whale addresses from transfer data.
 
-Logic:
-  1. Load transfers for a given date from data/YYYY-MM-DD/transfers.csv.
-  2. Find all addresses that sent >= $1 M in at least one transfer.
-  3. Count how many times each such address appears as a *recipient* (to_address)
-     across the full day's transfer dataset — a proxy for "how many inflows did
-     this address receive?".
-  4. Keep only addresses with < 10 inbound transfers, since exchange deposit
-     addresses typically receive hundreds of inflows while true whale wallets
-     are quiet on the receiving side.
-  5. Print a summary and save results to output/YYYY-MM-DD/potential_whales.csv.
+Algorithm
+─────────
+1. Load all transfer CSV files for the given date from ../../data/<DATE>/.
+2. Build a directed graph: nodes = addresses, edges = individual transfers
+   (multi-edges are allowed; each transfer becomes one edge with an 'amount').
+3. Filter nodes that satisfy ALL three conditions:
+     • total transferred volume (sent + received) ≥ VOLUME_THRESHOLD
+     • in-degree  < MAX_IN_DEGREE
+     • out-degree < MAX_OUT_DEGREE
+4. Print and optionally save the results.
 
-Usage:
-    python find_potential_whales.py                  # uses yesterday (UTC)
-    python find_potential_whales.py 2026-05-16       # specific date
+The degree constraints capture the "whale" intuition: a genuine whale moves
+large amounts but through very few counterparties, as opposed to an exchange
+or mixer that fans out to hundreds of addresses.
+
+Usage
+─────
+# Default thresholds (1 M USD volume, in/out degree < 10)
+python find_potential_whales.py
+
+# Custom thresholds
+python find_potential_whales.py --date 2026-05-16 --volume 500000 --max-in 5 --max-out 5
+
+# Save results to CSV
+python find_potential_whales.py --date 2026-05-16 --output output/whales.csv
 """
 
+import argparse
 import sys
-import pandas as pd
+from datetime import date
 from pathlib import Path
-from datetime import date, timedelta
 
-import config
+import networkx as nx
+import pandas as pd
 
-DATA_DIR = Path(config.DATA_DIR)
-OUTPUT_DIR = Path(config.OUTPUT_DIR)
+from config import DATA_DIR, OUTPUT_DIR, WHALE_THRESHOLD
 
-WHALE_THRESHOLD: float = 1_000_000   # minimum single-transfer amount (USD)
-MAX_INFLOWS: int = 10                # addresses with >= this many inflows are excluded
+# ── defaults ──────────────────────────────────────────────────────────────────
+DEFAULT_MAX_IN_DEGREE  = 10
+DEFAULT_MAX_OUT_DEGREE = 10
 
 
-def find_potential_whales(target_date: date) -> pd.DataFrame:
+# ── data loading ──────────────────────────────────────────────────────────────
+
+def load_transfers(data_date: str) -> pd.DataFrame:
     """
-    Return a DataFrame of potential whale addresses for *target_date*.
+    Load all CSV transfer files for *data_date* from ``../../data/<data_date>/``.
 
-    Columns:
-        address         — wallet address
-        total_sent      — total USD sent in transfers >= WHALE_THRESHOLD that day
-        large_tx_count  — number of transfers >= WHALE_THRESHOLD sent
-        inflow_count    — number of times the address received *any* transfer that day
-        tokens          — comma-separated list of tokens used in large transfers
-        large_transfers — number of individual large-send transactions
+    Each CSV must contain at minimum the columns:
+        hash, from_address, to_address, amount, token
+
+    Returns an empty DataFrame if no files are found.
     """
-    date_str = target_date.strftime("%Y-%m-%d")
-    transfers_path = DATA_DIR / date_str / "transfers.csv"
+    data_path = Path(DATA_DIR) / data_date
+    csv_files = sorted(data_path.glob("*.csv"))
+    if not csv_files:
+        print(f"[warn] No CSV files found in {data_path}", file=sys.stderr)
+        return pd.DataFrame()
 
-    if not transfers_path.exists():
-        raise FileNotFoundError(f"Transfer data not found: {transfers_path}")
+    dfs = []
+    for f in csv_files:
+        try:
+            df = pd.read_csv(f)
+            dfs.append(df)
+        except Exception as exc:
+            print(f"[warn] Could not read {f}: {exc}", file=sys.stderr)
 
-    df = pd.read_csv(transfers_path)
-    df["from_address"] = df["from_address"].str.lower().fillna("")
-    df["to_address"] = df["to_address"].str.lower().fillna("")
-    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+    if not dfs:
+        return pd.DataFrame()
 
-    # --- Step 1: addresses that sent at least one transfer >= $1 M ---
-    large_sends = df[df["amount"] >= WHALE_THRESHOLD].copy()
-    if large_sends.empty:
-        print(f"No transfers >= ${WHALE_THRESHOLD:,.0f} found on {date_str}.")
-        return pd.DataFrame(columns=[
-            "address", "total_sent", "large_tx_count", "inflow_count", "tokens"
-        ])
+    transfers = pd.concat(dfs, ignore_index=True)
 
-    # Aggregate per sender
-    agg = (
-        large_sends
-        .groupby("from_address")
-        .agg(
-            total_sent=("amount", "sum"),
-            large_tx_count=("amount", "count"),
-            tokens=("token", lambda s: ",".join(sorted(s.unique()))),
+    # Normalise addresses to lowercase for consistent matching
+    transfers["from_address"] = transfers["from_address"].str.lower().str.strip()
+    transfers["to_address"]   = transfers["to_address"].str.lower().str.strip()
+
+    # Deduplicate by tx hash + token to avoid double-counting when multiple
+    # CSVs overlap (the same transfer hash can appear in USDC and USDT files).
+    transfers = transfers.drop_duplicates(subset=["hash", "from_address", "to_address", "token"])
+
+    return transfers
+
+
+# ── graph construction ────────────────────────────────────────────────────────
+
+def build_graph(transfers: pd.DataFrame) -> nx.MultiDiGraph:
+    """
+    Build a directed multigraph from the transfer DataFrame.
+
+    Each row becomes a directed edge  from_address → to_address  with
+    attributes ``amount`` (USD) and ``token``.
+    """
+    G = nx.MultiDiGraph()
+
+    for _, row in transfers.iterrows():
+        G.add_edge(
+            row["from_address"],
+            row["to_address"],
+            amount=float(row["amount"]),
+            token=row.get("token", ""),
         )
-        .reset_index()
-        .rename(columns={"from_address": "address"})
-    )
 
-    # --- Step 2: count inflows (to_address appearances) for each candidate ---
-    inflow_counts = (
-        df[df["to_address"].isin(agg["address"])]
-        .groupby("to_address")
-        .size()
-        .reset_index(name="inflow_count")
-        .rename(columns={"to_address": "address"})
-    )
+    return G
 
-    result = agg.merge(inflow_counts, on="address", how="left")
-    result["inflow_count"] = result["inflow_count"].fillna(0).astype(int)
 
-    # --- Step 3: exclude addresses with too many inflows (likely exchange deposits) ---
-    whales = (
-        result[result["inflow_count"] < MAX_INFLOWS]
-        .sort_values("total_sent", ascending=False)
+# ── whale detection ───────────────────────────────────────────────────────────
+
+def compute_node_volumes(G: nx.MultiDiGraph) -> dict[str, float]:
+    """
+    Return a mapping of address → total USD volume (sent + received).
+    """
+    volumes: dict[str, float] = {}
+
+    for u, v, data in G.edges(data=True):
+        amt = data.get("amount", 0.0)
+        volumes[u] = volumes.get(u, 0.0) + amt
+        volumes[v] = volumes.get(v, 0.0) + amt
+
+    return volumes
+
+
+def find_potential_whales(
+    G: nx.MultiDiGraph,
+    volume_threshold: float = WHALE_THRESHOLD,
+    max_in_degree: int  = DEFAULT_MAX_IN_DEGREE,
+    max_out_degree: int = DEFAULT_MAX_OUT_DEGREE,
+) -> pd.DataFrame:
+    """
+    Identify whale candidates satisfying:
+        total_volume >= volume_threshold
+        in_degree    <  max_in_degree
+        out_degree   <  max_out_degree
+
+    Returns a DataFrame sorted by total_volume descending with columns:
+        address, total_volume, in_degree, out_degree,
+        total_sent, total_received
+    """
+    node_volumes = compute_node_volumes(G)
+
+    # Pre-compute sent / received volumes separately
+    sent_vol:     dict[str, float] = {}
+    received_vol: dict[str, float] = {}
+    for u, v, data in G.edges(data=True):
+        amt = data.get("amount", 0.0)
+        sent_vol[u]     = sent_vol.get(u, 0.0)     + amt
+        received_vol[v] = received_vol.get(v, 0.0) + amt
+
+    rows = []
+    for node in G.nodes():
+        in_deg  = G.in_degree(node)
+        out_deg = G.out_degree(node)
+        vol     = node_volumes.get(node, 0.0)
+
+        if (
+            vol >= volume_threshold
+            and in_deg  < max_in_degree
+            and out_deg < max_out_degree
+        ):
+            rows.append(
+                {
+                    "address":        node,
+                    "total_volume":   vol,
+                    "total_sent":     sent_vol.get(node, 0.0),
+                    "total_received": received_vol.get(node, 0.0),
+                    "in_degree":      in_deg,
+                    "out_degree":     out_deg,
+                }
+            )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "address", "total_volume", "total_sent",
+                "total_received", "in_degree", "out_degree",
+            ]
+        )
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values("total_volume", ascending=False)
         .reset_index(drop=True)
     )
 
-    return whales
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Find potential whale addresses in the transfer graph."
+    )
+    parser.add_argument(
+        "--date",
+        default=date.today().isoformat(),
+        help="Date folder to load (YYYY-MM-DD). Default: today.",
+    )
+    parser.add_argument(
+        "--volume",
+        type=float,
+        default=WHALE_THRESHOLD,
+        help=f"Minimum total USD volume. Default: {WHALE_THRESHOLD:,.0f}",
+    )
+    parser.add_argument(
+        "--max-in",
+        type=int,
+        default=DEFAULT_MAX_IN_DEGREE,
+        dest="max_in",
+        help=f"Maximum in-degree (exclusive). Default: {DEFAULT_MAX_IN_DEGREE}",
+    )
+    parser.add_argument(
+        "--max-out",
+        type=int,
+        default=DEFAULT_MAX_OUT_DEGREE,
+        dest="max_out",
+        help=f"Maximum out-degree (exclusive). Default: {DEFAULT_MAX_OUT_DEGREE}",
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Optional path to save results as CSV.",
+    )
+    return parser.parse_args()
 
 
 def main() -> None:
-    # Determine target date
-    if len(sys.argv) >= 2:
-        try:
-            target_date = date.fromisoformat(sys.argv[1])
-        except ValueError:
-            print(f"ERROR: Invalid date '{sys.argv[1]}'. Use YYYY-MM-DD format.")
-            sys.exit(1)
-    else:
-        target_date = date.today() - timedelta(days=1)  # yesterday UTC
+    args = _parse_args()
 
-    date_str = target_date.strftime("%Y-%m-%d")
-    print(f"Scanning potential whales for {date_str} …")
-    print(f"  Threshold : >= ${WHALE_THRESHOLD:,.0f} sent in a single transfer")
-    print(f"  Max inflows: < {MAX_INFLOWS} inbound transfers to the address")
-
-    try:
-        whales = find_potential_whales(target_date)
-    except FileNotFoundError as e:
-        print(f"ERROR: {e}")
+    print(f"[*] Loading transfers for {args.date} …")
+    transfers = load_transfers(args.date)
+    if transfers.empty:
+        print("[!] No transfer data found. Exiting.")
         sys.exit(1)
+    print(f"    {len(transfers):,} transfers loaded.")
 
-    if whales.empty:
-        print("No potential whales found after filtering.")
-        return
+    print("[*] Building transfer graph …")
+    G = build_graph(transfers)
 
-    # Print summary
-    print(f"\nFound {len(whales)} potential whale address(es):\n")
+    # ── graph summary ─────────────────────────────────────────────────────────
+    degrees     = [d for _, d in G.degree()]
+    in_degrees  = [d for _, d in G.in_degree()]
+    out_degrees = [d for _, d in G.out_degree()]
+    all_amounts = [data["amount"] for _, _, data in G.edges(data=True)]
+
+    print(f"\n  {'─'*40}")
+    print(f"  Graph Summary")
+    print(f"  {'─'*40}")
+    print(f"  Nodes            : {G.number_of_nodes():>12,}")
+    print(f"  Edges            : {G.number_of_edges():>12,}")
+    if degrees:
+        print(f"  Avg degree       : {sum(degrees)/len(degrees):>12.2f}")
+        print(f"  Max in-degree    : {max(in_degrees):>12,}")
+        print(f"  Max out-degree   : {max(out_degrees):>12,}")
+        print(f"  Avg in-degree    : {sum(in_degrees)/len(in_degrees):>12.2f}")
+        print(f"  Avg out-degree   : {sum(out_degrees)/len(out_degrees):>12.2f}")
+    if all_amounts:
+        total_vol = sum(all_amounts)
+        print(f"  Total volume ($) : {total_vol:>12,.2f}")
+        print(f"  Avg tx amount($) : {total_vol/len(all_amounts):>12,.2f}")
+        print(f"  Max tx amount($) : {max(all_amounts):>12,.2f}")
+    print(f"  {'─'*40}\n")
+
     print(
-        whales[["address", "total_sent", "large_tx_count", "inflow_count", "tokens"]]
-        .to_string(index=False)
+        f"[*] Searching for whales "
+        f"(volume ≥ ${args.volume:,.0f}, "
+        f"in_degree < {args.max_in}, "
+        f"out_degree < {args.max_out}) …"
+    )
+    whales = find_potential_whales(
+        G,
+        volume_threshold=args.volume,
+        max_in_degree=args.max_in,
+        max_out_degree=args.max_out,
     )
 
-    # Save output
-    out_dir = OUTPUT_DIR / date_str
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / "potential_whales.csv"
-    whales.to_csv(out_path, index=False)
-    print(f"\nSaved {len(whales)} rows → {out_path}")
+    if whales.empty:
+        print("[!] No whale candidates found with these thresholds.")
+        sys.exit(0)
+
+    print(f"\n    Found {len(whales)} potential whale(s):\n")
+    pd.set_option("display.float_format", "{:,.2f}".format)
+    pd.set_option("display.max_colwidth", 44)
+    print(whales.to_string(index=True))
+
+    if args.output:
+        out_path = Path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        whales.to_csv(out_path, index=False)
+        print(f"\n[*] Results saved to {out_path}")
 
 
 if __name__ == "__main__":
